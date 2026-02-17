@@ -11,8 +11,8 @@ class TransformerBlock(nn.Module):
         super(TransformerBlock, self).__init__()
 
         self.attention = GroupedQueryAttention(embed_size, heads, dropout=dropout, device=device)
-        self.norm1 = nn.LayerNorm(embed_size)
-        self.norm2 = nn.LayerNorm(embed_size)
+        self.norm1 = nn.RMSNorm(embed_size)
+        self.norm2 = nn.RMSNorm(embed_size)
 
         self.feed_forward = nn.Sequential(
             nn.Linear(embed_size, forward_expansion*embed_size),
@@ -62,7 +62,7 @@ class Decoder(nn.Module):
             ]
         )
 
-        self.norm = nn.LayerNorm(embed_size)
+        self.norm = nn.RMSNorm(embed_size)
         self.fc_out = nn.Linear(embed_size, target_vocab_size)
         self.dropout = nn.Dropout(dropout)
 
