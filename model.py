@@ -10,7 +10,7 @@ class TransformerBlock(nn.Module):
     def __init__(self, embed_size, heads, dropout, forward_expansion, device):
         super(TransformerBlock, self).__init__()
 
-        self.attention = GroupedQueryAttention(embed_size, heads, dropout=dropout)
+        self.attention = GroupedQueryAttention(embed_size, heads, dropout=dropout, device=device)
         self.norm1 = nn.LayerNorm(embed_size)
         self.norm2 = nn.LayerNorm(embed_size)
 

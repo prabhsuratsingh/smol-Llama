@@ -1,8 +1,10 @@
 import torch
 import torch.nn as nn
 
+from rope import RotaryEmbedding
+
 class GroupedQueryAttention(nn.Module):
-    def __init__(self, embed_size, heads, kv, dropout):
+    def __init__(self, embed_size, heads, kv, dropout, device):
         super(GroupedQueryAttention, self).__init__()
 
         self.embed_size = embed_size
@@ -12,6 +14,8 @@ class GroupedQueryAttention(nn.Module):
         self.kv_dim = kv * self.head_dim
         self.groups = heads // kv
 
+        self.rope = RotaryEmbedding(self.head_dim)
+
         assert(self.head_dim * heads == embed_size), "Embed size should be divisible by number of heads"
         assert(self.heads % self.kv_heads == 0), "Groups size has to be divisible by number of heads"
 
@@ -20,6 +24,8 @@ class GroupedQueryAttention(nn.Module):
         self.Lkv = nn.Linear(embed_size, 2*self.kv_dim, bias=True)
         self.fc_out = nn.Linear(embed_size, embed_size)
         self.attn_dropout = nn.Dropout(dropout)
+
+        self.device = device
 
     def forward(self, seq, mask=None, kv_cache=None):
         N, seq_len, _ = seq.shape
@@ -36,14 +42,21 @@ class GroupedQueryAttention(nn.Module):
         K = K.permute(0, 2, 1, 3)
         V = V.permute(0, 2, 1, 3)
 
-        if kv_cache is not None:
-            if kv_cache["k"] is not None:
-                K = torch.cat([kv_cache["k"], K], dim=2)
-                V = torch.cat([kv_cache["v"], V], dim=2)
-
-            new_cache = {"k": K, "v": V}
+        if kv_cache is not None and kv_cache["k"] is not None:
+            past_len = kv_cache["k"].shape[2]
         else:
-            new_cache = {"k": K, "v": V}
+            past_len = 0
+
+        positions = torch.arange(past_len, past_len + seq_len, device=self.device)
+
+        Q = self.rope(Q, positions)
+        K = self.rope(K, positions)
+
+        if kv_cache is not None and kv_cache["k"] is not None:
+            K = torch.cat([kv_cache["k"], K], dim=2)
+            V = torch.cat([kv_cache["v"], V], dim=2)
+
+        new_cache = {"k": K, "v": V}
 
         K = K.repeat_interleave(self.groups, dim=1)  
         V = V.repeat_interleave(self.groups, dim=1) 
@@ -52,7 +65,7 @@ class GroupedQueryAttention(nn.Module):
 
         energy = torch.einsum("nhqd,nhkd->nhqk", [Q, K])
 
-        if mask is not None and Q.shape[2] > 1:
+        if mask is not None and seq_len > 1:
             energy = energy.masked_fill(mask == 0, torch.finfo(energy.dtype).min)
 
         attention = self.attn_dropout(
