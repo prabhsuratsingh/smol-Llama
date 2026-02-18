@@ -18,8 +18,8 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("sin", sin, persistent=False)
 
     def forward(self, x, positions):
-        cos = self.cos[positions] 
-        sin = self.sin[positions]
+        cos = self.cos[positions].to(device=x.device, dtype=x.dtype)
+        sin = self.sin[positions].to(device=x.device, dtype=x.dtype)
 
         cos = cos.unsqueeze(0).unsqueeze(0)  
         sin = sin.unsqueeze(0).unsqueeze(0)

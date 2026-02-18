@@ -20,14 +20,14 @@ class GroupedQueryAttention(nn.Module):
         assert(self.heads % self.kv_heads == 0), "Groups size has to be divisible by number of heads"
 
 
-        self.Lq = nn.Linear(embed_size, embed_size, bias=True)
-        self.Lkv = nn.Linear(embed_size, 2*self.kv_dim, bias=True)
+        self.Lq = nn.Linear(embed_size, embed_size, bias=False)
+        self.Lkv = nn.Linear(embed_size, 2*self.kv_dim, bias=False)
         self.fc_out = nn.Linear(embed_size, embed_size)
         self.attn_dropout = nn.Dropout(dropout)
 
         self.device = device
 
-    def forward(self, seq, mask=None, kv_cache=None):
+    def forward(self, seq, kv_cache=None):
         N, seq_len, _ = seq.shape
         
         Wq = self.Lq(seq)
@@ -47,7 +47,7 @@ class GroupedQueryAttention(nn.Module):
         else:
             past_len = 0
 
-        positions = torch.arange(past_len, past_len + seq_len, device=self.device)
+        positions = torch.arange(past_len, past_len + seq_len, device=seq.device)
 
         Q = self.rope(Q, positions)
         K = self.rope(K, positions)
@@ -65,11 +65,21 @@ class GroupedQueryAttention(nn.Module):
 
         energy = torch.einsum("nhqd,nhkd->nhqk", [Q, K])
 
-        if mask is not None and seq_len > 1:
-            energy = energy.masked_fill(mask == 0, torch.finfo(energy.dtype).min)
+        q_len = seq_len
+        k_len = K.shape[2]
+
+        causal = torch.tril(
+            torch.ones(q_len, k_len, device=seq.device),
+            diagonal=past_len
+        )
+
+        energy = energy.masked_fill(
+            causal.unsqueeze(0).unsqueeze(0) == 0,
+            torch.finfo(energy.dtype).min
+        )
 
         attention = self.attn_dropout(
-            torch.softmax(energy / (self.head_dim ** (1/2)), dim=3)
+            torch.softmax(energy / (self.head_dim ** (1/2)), dim=-1)
         )
 
         out = torch.einsum("nhqk,nhkd->nhqd", [attention, V])

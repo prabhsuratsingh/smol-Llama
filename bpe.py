@@ -12,7 +12,7 @@ class BPE:
             self,
             text,
             vocab_size,
-            allowed_special=["<s>", "</s>", "<unk>"]
+            allowed_special={"<s>", "</s>", "<unk>"}
     ):
         if allowed_special is None:
             allowed_special = set()
@@ -54,15 +54,35 @@ class BPE:
             self.inverse_vocab[merged_str] = new_id
 
 
-    def encode(self, text):
+    def encode(self, text, allowed_special=None):
         text = text.replace("\r\n", "\n")
         text = text.replace(" ", "_")
 
+        if allowed_special is None:
+            allowed_special = set()
+
         ids = []
-        for ch in text:
+        i = 0
+        while i < len(text):
+            matched = False
+
+            # check special tokens
+            for tok in allowed_special:
+                if text.startswith(tok, i):
+                    ids.append(self.inverse_vocab[tok])
+                    i += len(tok)
+                    matched = True
+                    break
+
+            if matched:
+                continue
+
+            ch = text[i]
             ids.extend(self._encode_symbol(ch))
+            i += 1
 
         return ids
+
     
     def _encode_symbol(self, ch):
         if ch not in self.inverse_vocab:

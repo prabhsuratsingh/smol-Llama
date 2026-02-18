@@ -1,39 +1,39 @@
+import time
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from bpe import BPE
 from gqa_kv import GroupedQueryAttention
-
+from swi_glu import SwiGLU
 
 class TransformerBlock(nn.Module):
-    def __init__(self, embed_size, heads, dropout, forward_expansion, device):
+    def __init__(self, embed_size, heads, kv, dropout, device):
         super(TransformerBlock, self).__init__()
 
-        self.attention = GroupedQueryAttention(embed_size, heads, dropout=dropout, device=device)
+        self.attention = GroupedQueryAttention(embed_size, heads, kv=kv, dropout=dropout, device=device)
         self.norm1 = nn.RMSNorm(embed_size)
         self.norm2 = nn.RMSNorm(embed_size)
 
-        self.feed_forward = nn.Sequential(
-            nn.Linear(embed_size, forward_expansion*embed_size),
-            nn.GELU(),
-            nn.Linear(forward_expansion*embed_size, embed_size)
-        )
+        hidden = int(2 * embed_size * 4 / 3)
+
+        self.feed_forward = SwiGLU(embed_size, hidden)
+
 
         self.dropout = nn.Dropout(dropout)
         self.device = device
 
-    def forward(self, x, mask):
+    def forward(self, x, kv_cache=None):
 
-        x = x + self.dropout(
-            self.attention(self.norm1(x), mask)
-        )
+        attn_out, kv_cache_out = self.attention(self.norm1(x), kv_cache)
+
+        x = x + self.dropout(attn_out)
 
         x = x + self.dropout(
             self.feed_forward(self.norm2(x))
         )
 
-        return x
+        return x, kv_cache_out
     
 class Decoder(nn.Module):
     def __init__(
@@ -43,108 +43,76 @@ class Decoder(nn.Module):
             embed_size,
             num_layers,
             heads, 
-            forward_expansion,
+            kv,
             dropout,
             device,
-            max_length
     ):
         super(Decoder, self).__init__()
 
         self.device = device
         self.word_embedding = nn.Embedding(src_vocab_size, embed_size)
-        self.position_embedding = nn.Embedding(max_length, embed_size)
-
 
         self.layers = nn.ModuleList(
             [
-                TransformerBlock(embed_size, heads, dropout, forward_expansion, device)
+                TransformerBlock(embed_size, heads, kv, dropout, device)
                 for _ in range(num_layers)
             ]
         )
 
         self.norm = nn.RMSNorm(embed_size)
-        self.fc_out = nn.Linear(embed_size, target_vocab_size)
+        self.fc_out = nn.Linear(embed_size, target_vocab_size, bias=False)
         self.dropout = nn.Dropout(dropout)
 
         self.fc_out.weight = self.word_embedding.weight
 
 
-    def forward(self, x, target_mask):
-        N, seq_len = x.shape
+    def forward(self, x, kv_cache=None):
+        x = self.dropout(self.word_embedding(x))
+        new_cache = []
 
-        pos = torch.arange(0, seq_len, device=self.device).unsqueeze(0)
-        pos = pos.expand(N, seq_len)
-        
-        x = self.dropout(
-            self.word_embedding(x) + self.position_embedding(pos)
-        )
-
-        for layer in self.layers:
-            x = layer(x, target_mask)
+        for i, layer in enumerate(self.layers):
+            layer_cache = None if kv_cache is None else kv_cache[i]
+            x, layer_cache_out = layer(x, layer_cache)
+            new_cache.append(layer_cache_out)
 
         ln = self.dropout(self.norm(x))
         out = self.fc_out(ln)
 
-        return out
+        return out, new_cache
+
 
 class Llama(nn.Module):
     def __init__(
             self,
-            src_vocab_size,
-            target_vocab_size,
-            src_pad_index,
-            target_pad_index,
+            vocab_size,
             embed_size=256,
             num_layers=6,
             forward_expansion=4,
             heads=8,
+            kv=4,
             dropout=0,
             device="cuda",
-            max_length=100
     ):
         super(Llama, self).__init__()
 
         self.decoder = Decoder(
-            src_vocab_size,
-            target_vocab_size,
+            vocab_size,
+            vocab_size,
             embed_size,
             num_layers,
             heads,
-            forward_expansion,
+            kv,
             dropout,
             device,
-            max_length
         )
 
-        self.src_pad_index = src_pad_index
-        self.target_pad_index = target_pad_index
         self.device = device
-
-    def make_padding_mask(self, target):
-        # target: (N, T)
-        return (target != self.target_pad_index).unsqueeze(1).unsqueeze(2)
-        # shape: (N, 1, 1, T)
-
-
-    def make_target_mask(self, target):
-        N, T = target.shape
-
-        causal_mask = torch.tril(torch.ones((T, T), device=target.device))
-        causal_mask = causal_mask.unsqueeze(0).unsqueeze(1)
-        # (1, 1, T, T)
-
-        padding_mask = (target != self.target_pad_index).unsqueeze(1).unsqueeze(2)
-        # (N, 1, 1, T)
-
-        return causal_mask * padding_mask
-
     
-    def forward(self, target):
-        target_mask = self.make_target_mask(target)
+    def forward(self, target, kv_cache=None):
 
-        out = self.decoder(target, target_mask)
+        out, new_cache = self.decoder(target, kv_cache)
 
-        return out
+        return out, new_cache
     
 class LlamaDataset(torch.utils.data.Dataset):
     def __init__(self, text, tokenizer, block_size):
@@ -172,19 +140,36 @@ class LlamaDataset(torch.utils.data.Dataset):
         return x, y
     
 @torch.no_grad()
-def generate(model, tokenizer, prompt, max_new_tokens=50):
+def generate(model, tokenizer, prompt, max_new_tokens=50, device="cuda"):
     model.eval()
 
     tokens = tokenizer.encode(prompt)
-    tokens = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).to(device)
+    tokens = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)
+
+    kv_cache = None
+
+    #prefill
+    logits, kv_cache = model(tokens, kv_cache)
 
     for _ in range(max_new_tokens):
-        tokens_cond = tokens[:, -model.decoder.position_embedding.num_embeddings:]
-        logits = model(tokens_cond)
         next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+
+        logits, kv_cache = model(next_token, kv_cache)
         tokens = torch.cat([tokens, next_token], dim=1)
 
     return tokenizer.decode(tokens[0].tolist())
+
+
+def estimate_flops_per_token(model):
+    return 6 * count_parameters(model)
+
+def format_flops(flops):
+    if flops > 1e12:
+        return f"{flops/1e12:.2f} TFLOPs"
+    if flops > 1e9:
+        return f"{flops/1e9:.2f} GFLOPs"
+    return f"{flops:.0f}"
+
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters())
@@ -205,14 +190,11 @@ if __name__ == "__main__":
     vocab_size = len(tokenizer.vocab)
 
     model = Llama(
-        src_vocab_size=vocab_size,
-        target_vocab_size=vocab_size,
-        src_pad_index=tokenizer.get_special_token_id("<|endoftext|>"),
-        target_pad_index=tokenizer.get_special_token_id("<|endoftext|>"),
+        vocab_size=vocab_size,
         embed_size=256,
         num_layers=6,
         heads=8,
-        max_length=128
+        kv=4,
     ).to(device)
 
     dataset = LlamaDataset(
@@ -231,22 +213,30 @@ if __name__ == "__main__":
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
     criterion = nn.CrossEntropyLoss()
 
+    flops_per_token = estimate_flops_per_token(model)
+
     num_epochs = 5
-    log_interval = 100 
+    log_interval = 100
     global_step = 0
 
     model.train()
+
     for epoch in range(num_epochs):
         epoch_loss = 0.0
         num_batches = 0
         running_loss = 0.0
 
+        t0 = time.time()
+
         for step, (x, y) in enumerate(loader):
             global_step += 1
+
             x = x.to(device)
             y = y.to(device)
 
-            logits = model(x)
+            step_start = time.time()
+
+            logits, _ = model(x)
             loss = criterion(
                 logits.view(-1, logits.size(-1)),
                 y.view(-1)
@@ -256,30 +246,38 @@ if __name__ == "__main__":
             loss.backward()
             optimizer.step()
 
+            step_time = time.time() - step_start
+
+            tokens = x.numel()
+            flops = flops_per_token * tokens
+            tflops = flops / step_time / 1e12
+
             loss_val = loss.item()
             running_loss += loss_val
             epoch_loss += loss_val
             num_batches += 1
 
             if global_step % log_interval == 0:
-                avg_step_loss = running_loss / log_interval
+                avg_loss = running_loss / log_interval
+                tok_per_sec = tokens / step_time
+
                 print(
                     f"step {global_step:6d} | "
                     f"epoch {epoch+1} | "
-                    f"loss {avg_step_loss:.4f}"
+                    f"loss {avg_loss:.4f} | "
+                    f"{tok_per_sec:8.0f} tok/s | "
+                    f"{tflops:.2f} TFLOPs"
                 )
                 running_loss = 0.0
 
         avg_epoch_loss = epoch_loss / num_batches
-        print(
-            f"epoch {epoch+1}/{num_epochs} | "
-            f"avg loss {avg_epoch_loss:.4f}"
-        )
+        print(f"epoch {epoch+1}/{num_epochs} | avg loss {avg_epoch_loss:.4f}")
+
 
     print(f"Total parameters: {count_parameters(model):,}")
     print(f"Trainable parameters: {count_trainable_parameters(model):,}")
 
-    torch.save(model.state_dict(), "Llama_shakespeare.pt")
+    torch.save(model.state_dict(), "llama_shakespeare.pt")
     print("Model saved.")
 
     print("Test Generation : ")
