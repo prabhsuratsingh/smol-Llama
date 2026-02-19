@@ -281,4 +281,4 @@ if __name__ == "__main__":
     print("Model saved.")
 
     print("Test Generation : ")
-    print(generate(model, tokenizer, "Once upon a time"))
+    print(generate(model, tokenizer, "Once upon a time"))   
